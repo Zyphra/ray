@@ -546,8 +546,8 @@ def test_kill_actor_after_restart(shutdown_only):
 def test_worker_startup_failure_exits_cleanly(shutdown_only, tmp_path, monkeypatch):
     """Retain the stock worker's real wait status after a tracing startup error."""
     import json
-    from pathlib import Path
     import textwrap
+    from pathlib import Path
 
     from ray.cluster_utils import Cluster
 
