@@ -75,6 +75,131 @@ def _tail_file(path: str, max_lines: int = 200) -> str:
         return "".join(deque(f, maxlen=max_lines))
 
 
+def _capture_blocked_descendants(processes, root_identities, descendants):
+    for _, process in processes:
+        if process.poll() is not None:
+            continue
+        try:
+            root = psutil.Process(process.pid)
+            if root.create_time() != root_identities.get(process.pid):
+                raise RuntimeError(f"owned Ray service identity changed: {process.pid}")
+            children = root.children(recursive=True)
+        except psutil.NoSuchProcess:
+            continue
+        for child in children:
+            try:
+                descendants.add((child.pid, child.create_time()))
+            except psutil.NoSuchProcess:
+                pass
+
+
+def _shutdown_blocked_node(node, processes, root_identities, descendants):
+    """Drain and reap only this Linux blocked CLI's owned process tree."""
+    deadline = time.monotonic() + 30
+    forced = False
+
+    def capture_descendants():
+        _capture_blocked_descendants(processes, root_identities, descendants)
+
+    def matching_descendants():
+        result = []
+        for pid, created in descendants:
+            try:
+                child = psutil.Process(pid)
+                if child.create_time() == created:
+                    result.append(child)
+            except psutil.NoSuchProcess:
+                pass
+        return result
+
+    def reap_descendants():
+        for child in matching_descendants():
+            try:
+                # Only exact adopted descendants: never consume Node's Popen
+                # statuses or an unrelated child with waitpid(-1).
+                pid, status = os.waitpid(child.pid, os.WNOHANG)
+                if pid:
+                    cli_logger.print(
+                        "Reaped owned Ray descendant pid={} exit code={}",
+                        pid, os.waitstatus_to_exitcode(status),
+                    )
+            except ChildProcessError:
+                # A live raylet may still own and reap this child itself.
+                pass
+
+    def drain_roots(selected, until):
+        while time.monotonic() < until:
+            capture_descendants()
+            if all(process.poll() is not None for _, process in selected):
+                return
+            time.sleep(min(0.05, max(0, until - time.monotonic())))
+
+    cli_logger.print("Owned Ray service identities: {}", root_identities)
+    capture_descendants()
+    # The monitor reports TERM through GCS, and raylet unregisters through
+    # GCS before stopping its workers/agents. Keep that dependency alive.
+    services = [
+        item for item in processes
+        if item[0] not in (
+            ray_constants.PROCESS_TYPE_GCS_SERVER,
+            ray_constants.PROCESS_TYPE_REAPER,
+        )
+    ]
+    for _, process in services:
+        if process.poll() is None:
+            process.terminate()
+    drain_roots(services, min(deadline, time.monotonic() + 16))
+    capture_descendants()
+    for _, process in processes:
+        if process.poll() is None:
+            process.terminate()
+    drain_roots(processes, min(deadline, time.monotonic() + 2))
+    for process_type, process in processes:
+        if process.poll() is None:
+            forced = True
+            cli_logger.error("Force killing owned Ray {} pid={}", process_type, process.pid)
+            process.kill()
+    drain_roots(processes, min(deadline, time.monotonic() + 2))
+    if any(process.poll() is None for _, process in processes):
+        raise RuntimeError("owned Ray service survived forced shutdown")
+    # Every direct Popen is already reaped. The existing Node owner clears its
+    # bookkeeping without unbounded waits or changing generic Node behavior.
+    node.kill_all_processes(check_alive=False, allow_graceful=False, wait=False)
+
+    reap_descendants()
+    for child in matching_descendants():
+        try:
+            if child.status() != psutil.STATUS_ZOMBIE:
+                child.terminate()
+        except psutil.NoSuchProcess:
+            pass
+    # Reparented trainer workers may still be unwinding their own children.
+    # Spend the remaining shared grace here, retaining five seconds to kill
+    # and reap a genuinely live survivor before the same deadline.
+    until = max(time.monotonic(), deadline - 5)
+    while matching_descendants() and time.monotonic() < until:
+        reap_descendants()
+        time.sleep(min(0.05, max(0, until - time.monotonic())))
+    for child in matching_descendants():
+        try:
+            # A zombie has already ended. SIGKILL cannot kill it, and must
+            # not turn its parent's pending reap into a forced-stop failure.
+            if child.status() != psutil.STATUS_ZOMBIE:
+                child.kill()
+                forced = True
+                cli_logger.error("Force killing owned Ray descendant pid={}", child.pid)
+        except psutil.NoSuchProcess:
+            pass
+    while matching_descendants() and time.monotonic() < deadline:
+        reap_descendants()
+        time.sleep(min(0.05, max(0, deadline - time.monotonic())))
+    reap_descendants()
+    remaining = [(child.pid, child.create_time()) for child in matching_descendants()]
+    if remaining:
+        raise RuntimeError(f"owned Ray descendants survived shutdown: {remaining}")
+    return processes, forced
+
+
 def _log_unexpected_subprocess_exit_details(
     unexpected_deceased, logs_dir: str, process_exit_logger
 ) -> None:
@@ -847,6 +972,15 @@ def start(
 ):
     """Start Ray processes manually on the local machine."""
 
+    if block and sys.platform.startswith("linux"):
+        # Adopt raylet children if a failed GCS forces their parent to die.
+        # The blocked CLI must reap them before exiting, not leave them to PID1.
+        utils = ray._private.utils
+        if not utils.detect_fate_sharing_support_linux() or utils.linux_prctl(
+            36, 1, 0, 0, 0  # PR_SET_CHILD_SUBREAPER
+        ) != 0:
+            raise RuntimeError("Linux blocked Ray CLI could not establish child ownership")
+
     # Whether the original arguments include node_ip_address.
     include_node_ip_address = False
     if node_ip_address is not None:
@@ -1256,6 +1390,23 @@ def start(
     ray._private.utils.write_ray_address(ray_params.gcs_address, temp_dir)
 
     if block:
+        blocked_processes = [
+            (process_type, info.process)
+            for process_type, infos in node.all_processes.items()
+            for info in infos
+        ]
+        root_identities = {}
+        descendant_identities = set()
+        if sys.platform.startswith("linux"):
+            for _, process in blocked_processes:
+                try:
+                    root_identities[process.pid] = psutil.Process(process.pid).create_time()
+                except psutil.NoSuchProcess:
+                    # An already-dead root remains in the Popen status list.
+                    process.poll()
+            _capture_blocked_descendants(
+                blocked_processes, root_identities, descendant_identities
+            )
         logs_dir = node.get_logs_dir_path()
         process_exit_log_path = os.path.join(logs_dir, "ray_process_exit.log")
         cli_logger.newline()
@@ -1268,38 +1419,88 @@ def start(
                 "printed if any of them terminate unexpectedly. Subprocesses "
                 "exit with SIGTERM will be treated as graceful, thus NOT reported."
             )
-            cli_logger.print(
-                "Process exit logs will be saved to: {}", cf.bold(process_exit_log_path)
-            )
-            cli_logger.flush()
             try:
                 process_exit_logger = setup_process_exit_logger(process_exit_log_path)
             except Exception as e:
                 cli_logger.warning("Failed to init process exit logger: {}", e)
                 process_exit_logger = None
 
+        # These are the existing blocked CLI monitor's accepted child exits.
+        expected_return_codes = [
+            0,
+            signal.SIGTERM,
+            -1 * signal.SIGTERM,
+            128 + signal.SIGTERM,
+        ]
+        closing = False
+
+        def sigterm_handler(signum, frame):
+            nonlocal closing
+            if closing:
+                return
+            closing = True
+            # Node's generic TERM handler exits 1 for drivers. A blocked CLI
+            # instead owns a deliberate runtime stop; retain each raw child
+            # status across Node's removal of its process bookkeeping.
+            processes = blocked_processes
+            forced = False
+            if sys.platform.startswith("linux"):
+                try:
+                    processes, forced = _shutdown_blocked_node(
+                        node, blocked_processes, root_identities, descendant_identities
+                    )
+                except Exception as error:
+                    forced = True
+                    cli_logger.error("Owned Ray CLI shutdown failed: {}", error)
+            else:
+                node.kill_all_processes(
+                    check_alive=False, allow_graceful=True, wait=True
+                )
+            unexpected_deceased = [
+                (process_type, process)
+                for process_type, process in processes
+                if process.poll() not in expected_return_codes
+            ]
+            if unexpected_deceased:
+                cli_logger.error("Some Ray subprocesses exited unexpectedly:")
+                _log_unexpected_subprocess_exit_details(
+                    unexpected_deceased, logs_dir, process_exit_logger
+                )
+                cli_logger.flush()
+            exit_code = 1 if unexpected_deceased or forced else 128 + signum
+            cli_logger.flush()
+            if sys.platform.startswith("linux"):
+                # The bounded owner has finished; generic atexit must not start
+                # another shutdown after an error or deadline expiration.
+                os._exit(exit_code)
+            sys.exit(exit_code)
+
+        ray._private.utils.set_sigterm_handler(sigterm_handler)
+        cli_logger.print(
+            "Process exit logs will be saved to: {}", cf.bold(process_exit_log_path)
+        )
+        cli_logger.flush()
+
         while True:
             time.sleep(1)
+            ownership_error = None
+            if sys.platform.startswith("linux"):
+                try:
+                    _capture_blocked_descendants(
+                        blocked_processes, root_identities, descendant_identities
+                    )
+                except Exception as error:
+                    ownership_error = error
             deceased = node.dead_processes()
 
-            # Report unexpected exits of subprocesses with unexpected return codes.
-            # We are explicitly expecting SIGTERM because this is how `ray stop` sends
-            # shutdown signal to subprocesses, i.e. log_monitor, raylet...
-            # NOTE(rickyyx): We are treating 128+15 as an expected return code since
-            # this is what autoscaler/_private/monitor.py does upon SIGTERM
-            # handling.
-            expected_return_codes = [
-                0,
-                signal.SIGTERM,
-                -1 * signal.SIGTERM,
-                128 + signal.SIGTERM,
-            ]
             unexpected_deceased = [
                 (process_type, process)
                 for process_type, process in deceased
-                if process.returncode not in expected_return_codes
+                if process.poll() not in expected_return_codes
             ]
-            if len(unexpected_deceased) > 0:
+            if unexpected_deceased or ownership_error is not None:
+                if ownership_error is not None:
+                    cli_logger.error("Owned Ray descendant capture failed: {}", ownership_error)
                 cli_logger.newline()
                 cli_logger.error("Some Ray subprocesses exited unexpectedly:")
                 _log_unexpected_subprocess_exit_details(
@@ -1314,7 +1515,17 @@ def start(
 
                 # explicitly kill all processes since atexit handlers
                 # will not exit with errors.
-                node.kill_all_processes(check_alive=False, allow_graceful=False)
+                closing = True
+                if sys.platform.startswith("linux"):
+                    try:
+                        _shutdown_blocked_node(
+                            node, blocked_processes, root_identities, descendant_identities
+                        )
+                    except Exception as error:
+                        cli_logger.error("Owned Ray CLI shutdown failed: {}", error)
+                else:
+                    node.kill_all_processes(check_alive=False, allow_graceful=False)
+                cli_logger.flush()
                 os._exit(1)
         # not-reachable
 

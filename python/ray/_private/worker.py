@@ -699,13 +699,22 @@ class Worker:
         if self._file_rotation_enabled:
             return
 
+        try:
+            out_offset = self.get_current_out_offset()
+            err_offset = self.get_current_err_offset()
+        except FileNotFoundError:
+            # Worker log files are auxiliary observability artifacts. If one is
+            # removed while the worker is alive, omit task log attribution
+            # instead of failing the user task.
+            return
+
         self.core_worker.record_task_log_start(
             task_id,
             attempt_number,
             self.get_out_file_path(),
             self.get_err_file_path(),
-            self.get_current_out_offset(),
-            self.get_current_err_offset(),
+            out_offset,
+            err_offset,
         )
 
     def record_task_log_end(self, task_id: TaskID, attempt_number: int):
@@ -725,11 +734,19 @@ class Worker:
         if self._file_rotation_enabled:
             return
 
+        try:
+            out_offset = self.get_current_out_offset()
+            err_offset = self.get_current_err_offset()
+        except FileNotFoundError:
+            # Do not let a missing observability artifact replace the task's
+            # return value or original exception.
+            return
+
         self.core_worker.record_task_log_end(
             task_id,
             attempt_number,
-            self.get_current_out_offset(),
-            self.get_current_err_offset(),
+            out_offset,
+            err_offset,
         )
 
     def get_out_file_path(self) -> str:

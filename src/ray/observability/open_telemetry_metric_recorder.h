@@ -112,6 +112,23 @@ class OpenTelemetryMetricRecorder {
  private:
   OpenTelemetryMetricRecorder();
   std::shared_ptr<opentelemetry::sdk::metrics::MeterProvider> meter_provider_;
+  std::shared_ptr<opentelemetry::sdk::metrics::MetricReader> metric_reader_;
+  std::mutex reader_mutex_;
+  enum class MetricKind { Gauge, Counter, Sum, Histogram };
+  struct MetricDefinition {
+    MetricKind kind;
+    std::string description;
+    std::vector<double> buckets;
+    std::string *gauge_name = nullptr;
+  };
+  using ObservableInstrument = opentelemetry::nostd::shared_ptr<
+      opentelemetry::metrics::ObservableInstrument>;
+  absl::flat_hash_map<std::string, MetricDefinition> metric_definitions_;
+
+  // Called with mutex_ held. Gauge callbacks are attached after releasing it.
+  ObservableInstrument CreateInstrument(const std::string &name,
+                                        const MetricDefinition &definition);
+  void RegisterMetric(const std::string &name, MetricDefinition definition);
   opentelemetry::exporter::otlp::OtlpGrpcMetricExporterOptions exporter_options_;
 
   // Map of metric names to their observations (aka. set of tags and metric values).
@@ -136,9 +153,6 @@ class OpenTelemetryMetricRecorder {
   std::list<std::string> gauge_metric_names_;
   // Lock for thread safety when modifying state.
   std::mutex mutex_;
-  // Flag to indicate if the recorder is shutting down. This is used to make sure that
-  // the recorder will only shutdown once.
-  std::atomic<bool> is_shutdown_{false};
   // The name of the meter used for this recorder.
   const std::string meter_name_ = "ray";
 

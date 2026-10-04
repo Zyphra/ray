@@ -88,6 +88,8 @@ OpenTelemetryMetricRecorder &OpenTelemetryMetricRecorder::GetInstance() {
 void OpenTelemetryMetricRecorder::Start(const std::string &endpoint,
                                         std::chrono::milliseconds interval,
                                         std::chrono::milliseconds timeout) {
+  std::lock_guard<std::mutex> lock(reader_mutex_);
+  RAY_CHECK(!metric_reader_) << "Metric reader is already running";
   // Create an OTLP exporter
   exporter_options_.endpoint = endpoint;
   // This line ensures that only the delta values for count and sum are exported during
@@ -171,20 +173,10 @@ void OpenTelemetryMetricRecorder::Start(const std::string &endpoint,
   opentelemetry::sdk::metrics::PeriodicExportingMetricReaderOptions reader_options;
   reader_options.export_interval_millis = interval;
   reader_options.export_timeout_millis = timeout;
-  auto reader =
-      std::make_unique<opentelemetry::sdk::metrics::PeriodicExportingMetricReader>(
+  metric_reader_ =
+      std::make_shared<opentelemetry::sdk::metrics::PeriodicExportingMetricReader>(
           std::move(exporter), reader_options);
-  // Reset the is_shutdown_ flag to false to ensure the newly added metric reader will
-  // be shut down correctly.
-  //
-  // In most cases, OpenTelemetryMetricRecorder is initialized and shut down only once
-  // per process, so setting this to false is effectively a no-op. However, in the driver
-  // process, the recorder may be initialized and shut down multiple times (e.g., repeated
-  // calls to ray.init() and ray.shutdown()). In such cases, is_shutdown_ may already be
-  // true when we reach this point (leaking from the previous ray cluster). Resetting it
-  // to false ensures that the newly added metric reader will be shut down correctly.
-  is_shutdown_ = false;
-  meter_provider_->AddMetricReader(std::move(reader));
+  meter_provider_->AddMetricReader(metric_reader_);
 }
 
 OpenTelemetryMetricRecorder::OpenTelemetryMetricRecorder() {
@@ -199,13 +191,40 @@ OpenTelemetryMetricRecorder::OpenTelemetryMetricRecorder() {
 }
 
 void OpenTelemetryMetricRecorder::Shutdown() {
-  bool expected = false;
-  if (!is_shutdown_.compare_exchange_strong(expected, true)) {
-    // Already shut down, skip
+  std::lock_guard<std::mutex> lock(reader_mutex_);
+  if (!metric_reader_) {
     return;
   }
-  meter_provider_->ForceFlush();
-  meter_provider_->Shutdown();
+  metric_reader_->ForceFlush();
+  metric_reader_->Shutdown();
+  metric_reader_.reset();
+
+  // Both provider shutdown and its collector list are permanent. Rebuild the
+  // pipeline after joining its reader so stopped collectors cannot retain new
+  // metric deltas. Existing stats objects continue to record by metric name.
+  std::shared_ptr<opentelemetry::sdk::metrics::MeterProvider> previous_provider;
+  std::vector<std::pair<ObservableInstrument, std::string *>> callbacks;
+  {
+    std::lock_guard<std::mutex> metric_lock(mutex_);
+    previous_provider = std::move(meter_provider_);
+    meter_provider_ = std::make_shared<opentelemetry::sdk::metrics::MeterProvider>();
+    registered_instruments_.clear();
+    for (const auto &[name, definition] : metric_definitions_) {
+      auto observable = CreateInstrument(name, definition);
+      if (observable) {
+        callbacks.emplace_back(std::move(observable), definition.gauge_name);
+      }
+    }
+    opentelemetry::metrics::Provider::SetMeterProvider(
+        opentelemetry::nostd::shared_ptr<opentelemetry::metrics::MeterProvider>(
+            meter_provider_));
+  }
+  // The new provider has no reader yet. Preserve the callback lock order while
+  // reader_mutex_ prevents Start from collecting the rebuilt instruments early.
+  for (const auto &[instrument, name] : callbacks) {
+    instrument->AddCallback(&DoubleGaugeCallback, static_cast<void *>(name));
+  }
+  previous_provider->Shutdown();
 }
 
 void OpenTelemetryMetricRecorder::CollectGaugeMetricValues(
@@ -222,38 +241,74 @@ void OpenTelemetryMetricRecorder::CollectGaugeMetricValues(
   it->second.clear();
 }
 
-void OpenTelemetryMetricRecorder::RegisterGaugeMetric(const std::string &name,
-                                                      const std::string &description) {
-  std::string *name_ptr;
-  opentelemetry::nostd::shared_ptr<opentelemetry::metrics::ObservableInstrument>
-      instrument;
+void OpenTelemetryMetricRecorder::RegisterMetric(const std::string &name,
+                                                 MetricDefinition definition) {
+  ObservableInstrument observable;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (registered_instruments_.contains(name)) {
-      // Already registered.  Note that this is a common case for metrics defined
-      // via Metric interface. See https://github.com/ray-project/ray/issues/54538
-      // for more details.
       return;
     }
-    gauge_metric_names_.push_back(name);
-    name_ptr = &gauge_metric_names_.back();
-    instrument = GetMeter()->CreateDoubleObservableGauge(name, description, "");
-    observations_by_name_[name] = {};
-    registered_instruments_[name] = instrument;
+    if (definition.kind == MetricKind::Gauge) {
+      gauge_metric_names_.push_back(name);
+      definition.gauge_name = &gauge_metric_names_.back();
+    }
+    metric_definitions_.emplace(name, definition);
+    observable = CreateInstrument(name, definition);
   }
-  // Important: Do not hold mutex_ (mutex A) when registering the callback.
-  //
-  // The callback function will be invoked later by the OpenTelemetry SDK,
-  // and it will attempt to acquire mutex_ (A) again. Meanwhile, both this function
-  // and the callback may also acquire an internal mutex (mutex B) owned by the
-  // instrument object.
-  //
-  // If we hold mutex A while registering the callback—and the callback later tries
-  // to acquire A while holding B—a lock-order inversion may occur, leading to
-  // a potential deadlock.
-  //
-  // To avoid this, ensure the callback is registered *after* releasing mutex_ (A).
-  instrument->AddCallback(&DoubleGaugeCallback, static_cast<void *>(name_ptr));
+  // A gauge callback takes mutex_. Never acquire the SDK callback lock while
+  // holding mutex_, since collection uses the opposite lock order.
+  if (observable) {
+    observable->AddCallback(&DoubleGaugeCallback,
+                            static_cast<void *>(definition.gauge_name));
+  }
+}
+
+OpenTelemetryMetricRecorder::ObservableInstrument
+OpenTelemetryMetricRecorder::CreateInstrument(const std::string &name,
+                                              const MetricDefinition &definition) {
+  switch (definition.kind) {
+  case MetricKind::Gauge: {
+    auto instrument = GetMeter()->CreateDoubleObservableGauge(
+        name, definition.description, "");
+    observations_by_name_.try_emplace(name);
+    registered_instruments_[name] = instrument;
+    return instrument;
+  }
+  case MetricKind::Counter:
+    registered_instruments_[name] =
+        GetMeter()->CreateDoubleCounter(name, definition.description, "");
+    return {};
+  case MetricKind::Sum:
+    registered_instruments_[name] =
+        GetMeter()->CreateDoubleUpDownCounter(name, definition.description, "");
+    return {};
+  case MetricKind::Histogram: {
+    auto aggregation_config =
+        std::make_shared<opentelemetry::sdk::metrics::HistogramAggregationConfig>();
+    aggregation_config->boundaries_ = definition.buckets;
+    auto view = std::make_unique<opentelemetry::sdk::metrics::View>(
+        name, definition.description, "",
+        opentelemetry::sdk::metrics::AggregationType::kHistogram, aggregation_config);
+    auto instrument_selector =
+        std::make_unique<opentelemetry::sdk::metrics::InstrumentSelector>(
+            opentelemetry::sdk::metrics::InstrumentType::kHistogram, name, "");
+    auto meter_selector = std::make_unique<opentelemetry::sdk::metrics::MeterSelector>(
+        meter_name_, "", "");
+    meter_provider_->AddView(
+        std::move(instrument_selector), std::move(meter_selector), std::move(view));
+    registered_instruments_[name] =
+        GetMeter()->CreateDoubleHistogram(name, definition.description, "");
+    return {};
+  }
+  }
+  RAY_CHECK(false) << "Unsupported metric kind";
+  return {};
+}
+
+void OpenTelemetryMetricRecorder::RegisterGaugeMetric(const std::string &name,
+                                                      const std::string &description) {
+  RegisterMetric(name, {MetricKind::Gauge, description, {}});
 }
 
 bool OpenTelemetryMetricRecorder::IsMetricRegistered(const std::string &name) {
@@ -263,68 +318,19 @@ bool OpenTelemetryMetricRecorder::IsMetricRegistered(const std::string &name) {
 
 void OpenTelemetryMetricRecorder::RegisterCounterMetric(const std::string &name,
                                                         const std::string &description) {
-  std::lock_guard<std::mutex> lock(mutex_);
-  if (registered_instruments_.contains(name)) {
-    // Already registered.  Note that this is a common case for metrics defined
-    // via Metric interface. See https://github.com/ray-project/ray/issues/54538
-    // for more details.
-    return;
-  }
-  auto instrument = GetMeter()->CreateDoubleCounter(name, description, "");
-  registered_instruments_[name] = std::move(instrument);
+  RegisterMetric(name, {MetricKind::Counter, description, {}});
 }
 
 void OpenTelemetryMetricRecorder::RegisterSumMetric(const std::string &name,
                                                     const std::string &description) {
-  std::lock_guard<std::mutex> lock(mutex_);
-  if (registered_instruments_.contains(name)) {
-    // Already registered.  Note that this is a common case for metrics defined
-    // via Metric interface. See https://github.com/ray-project/ray/issues/54538
-    // for more details.
-    return;
-  }
-  auto instrument = GetMeter()->CreateDoubleUpDownCounter(name, description, "");
-  registered_instruments_[name] = std::move(instrument);
+  RegisterMetric(name, {MetricKind::Sum, description, {}});
 }
 
 void OpenTelemetryMetricRecorder::RegisterHistogramMetric(
     const std::string &name,
     const std::string &description,
     const std::vector<double> &buckets) {
-  std::lock_guard<std::mutex> lock(mutex_);
-  if (registered_instruments_.contains(name)) {
-    // Already registered.  Note that this is a common case for metrics defined
-    // via Metric interface. See https://github.com/ray-project/ray/issues/54538
-    // for more details.
-    return;
-  }
-  // Create a histogram instrument with explicit buckets
-  // TODO(can-anyscale): use factory pattern for a cleaner creation of histogram view:
-  // https://github.com/open-telemetry/opentelemetry-cpp/blob/main/examples/metrics_simple/metrics_ostream.cc#L93.
-  // This requires a new version of the OpenTelemetry SDK. See
-  // https://github.com/ray-project/ray/issues/54538 for the complete backlog of Ray
-  // metric infra improvements.
-  auto aggregation_config =
-      std::make_shared<opentelemetry::sdk::metrics::HistogramAggregationConfig>();
-  aggregation_config->boundaries_ = buckets;
-  auto view = std::make_unique<opentelemetry::sdk::metrics::View>(
-      name,
-      description,
-      /*unit=*/"",
-      opentelemetry::sdk::metrics::AggregationType::kHistogram,
-      aggregation_config);
-
-  auto instrument_selector =
-      std::make_unique<opentelemetry::sdk::metrics::InstrumentSelector>(
-          opentelemetry::sdk::metrics::InstrumentType::kHistogram,
-          name,
-          /*unit_filter=*/"");
-  auto meter_selector = std::make_unique<opentelemetry::sdk::metrics::MeterSelector>(
-      meter_name_, /*meter_version=*/"", /*schema_url=*/"");
-  meter_provider_->AddView(
-      std::move(instrument_selector), std::move(meter_selector), std::move(view));
-  auto instrument = GetMeter()->CreateDoubleHistogram(name, description, /*unit=*/"");
-  registered_instruments_[name] = std::move(instrument);
+  RegisterMetric(name, {MetricKind::Histogram, description, buckets});
 }
 
 void OpenTelemetryMetricRecorder::SetMetricValue(
