@@ -113,7 +113,19 @@ void CoreWorkerProcess::Shutdown() {
 
 bool CoreWorkerProcess::IsInitialized() { return core_worker_process != nullptr; }
 
-void CoreWorkerProcess::HandleAtExit() { core_worker_process.reset(); }
+void CoreWorkerProcess::HandleAtExit() {
+  if (!core_worker_process) {
+    return;
+  }
+  if (!core_worker_process->StopIOThreadAtExit()) {
+    // Returning while IO is active would expose its callbacks to destruction
+    // of logging and other globals. Use the existing failed-shutdown policy
+    // instead of destroying active targets or continuing static teardown.
+    RAY_LOG(ERROR) << "Native exit could not drain core worker IO.";
+    ray::QuickExit();
+  }
+  core_worker_process.reset();
+}
 
 CoreWorker &CoreWorkerProcess::GetCoreWorker() {
   EnsureInitialized(/*quick_exit*/ true);
@@ -862,6 +874,34 @@ CoreWorkerProcessImpl::CoreWorkerProcessImpl(const CoreWorkerOptions &options)
                        "with dashboard support: `pip install 'ray[default]'`.";
     }
   }
+}
+
+bool CoreWorkerProcessImpl::StopIOThreadAtExit() {
+  if (io_thread_.joinable() && io_thread_.get_id() == boost::this_thread::get_id()) {
+    io_service_.stop();
+    return false;
+  }
+
+  // Share the existing 30-second shutdown budget between an already-started
+  // shutdown and the IO join. Do not initiate language callbacks at native exit.
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+  auto remaining = [&deadline]() {
+    const auto now = std::chrono::steady_clock::now();
+    return now < deadline
+               ? std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now)
+               : std::chrono::milliseconds::zero();
+  };
+  auto worker = TryGetCoreWorker();
+  if (worker) {
+    worker->WaitForShutdownComplete(remaining());
+  }
+  io_service_.stop();
+  if (!io_thread_.joinable()) {
+    return true;
+  }
+  // Stopping Asio cannot interrupt a callback already running. An expired join
+  // must follow failed-shutdown policy, not return into global destruction.
+  return io_thread_.try_join_for(boost::chrono::milliseconds(remaining().count()));
 }
 
 CoreWorkerProcessImpl::~CoreWorkerProcessImpl() {
