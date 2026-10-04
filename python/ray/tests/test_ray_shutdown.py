@@ -540,7 +540,9 @@ def test_kill_actor_after_restart(shutdown_only):
     wait_for_condition(lambda: len(get_all_ray_worker_processes()) == 0)
 
 
-@pytest.mark.skipif(platform.system() == "Windows", reason="Native atexit is POSIX only.")
+@pytest.mark.skipif(
+    platform.system() == "Windows", reason="Native atexit is POSIX only."
+)
 def test_worker_startup_failure_exits_cleanly(shutdown_only, tmp_path, monkeypatch):
     """Retain the stock worker's real wait status after a tracing startup error."""
     import json
@@ -621,7 +623,10 @@ def test_worker_startup_failure_exits_cleanly(shutdown_only, tmp_path, monkeypat
                     path.read_text(errors="replace")
                     for path in log_dir.glob(f"worker-*-{pid}.err")
                 )
-                if not native_paths or "ordinary-worker-tracing-startup-failure" not in errors:
+                if (
+                    not native_paths
+                    or "ordinary-worker-tracing-startup-failure" not in errors
+                ):
                     continue
                 failure.update(status)
                 failure["errors"] = errors
@@ -632,11 +637,15 @@ def test_worker_startup_failure_exits_cleanly(shutdown_only, tmp_path, monkeypat
             return False
 
         wait_for_condition(status_retained, timeout=75)
-        assert "RuntimeError: ordinary-worker-tracing-startup-failure" in failure["errors"]
+        assert (
+            "RuntimeError: ordinary-worker-tracing-startup-failure" in failure["errors"]
+        )
         assert not failure["timed_out"], failure
         # wait(), unlike PID disappearance, rejects SIGSEGV/SIGABRT and cleanup kills.
         assert failure["returncode"] == 1, failure
-        assert "Force exiting to avoid undefined behavior." not in failure["native_logs"]
+        assert (
+            "Force exiting to avoid undefined behavior." not in failure["native_logs"]
+        )
     finally:
         try:
             if task is not None:

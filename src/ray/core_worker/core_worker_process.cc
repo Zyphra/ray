@@ -878,8 +878,7 @@ CoreWorkerProcessImpl::CoreWorkerProcessImpl(const CoreWorkerOptions &options)
 }
 
 bool CoreWorkerProcessImpl::StopIOThreadAtExit() {
-  if (io_thread_.joinable() &&
-      io_thread_.get_id() == boost::this_thread::get_id()) {
+  if (io_thread_.joinable() && io_thread_.get_id() == boost::this_thread::get_id()) {
     io_service_.stop();
     return false;
   }
