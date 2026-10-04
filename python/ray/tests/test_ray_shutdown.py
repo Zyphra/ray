@@ -540,5 +540,113 @@ def test_kill_actor_after_restart(shutdown_only):
     wait_for_condition(lambda: len(get_all_ray_worker_processes()) == 0)
 
 
+@pytest.mark.skipif(platform.system() == "Windows", reason="Native atexit is POSIX only.")
+def test_worker_startup_failure_exits_cleanly(shutdown_only, tmp_path, monkeypatch):
+    """Retain the stock worker's real wait status after a tracing startup error."""
+    import json
+    from pathlib import Path
+    import textwrap
+
+    from ray.cluster_utils import Cluster
+
+    module_name = "worker_startup_failure_tracing"
+    (tmp_path / f"{module_name}.py").write_text(
+        "import ray\n"
+        "def setup():\n"
+        "    if ray._private.worker.global_worker.mode == ray.WORKER_MODE:\n"
+        "        raise RuntimeError('ordinary-worker-tracing-startup-failure')\n"
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    receipts = tmp_path / "statuses"
+    receipts.mkdir()
+    default_worker = Path(ray.__file__).parent / "_private/workers/default_worker.py"
+    launcher = tmp_path / "retain_worker_status.py"
+    launcher.write_text(
+        textwrap.dedent(
+            f"""\
+            import json
+            import os
+            from pathlib import Path
+            import subprocess
+            import sys
+
+            child = subprocess.Popen([sys.executable, {str(default_worker)!r}, *sys.argv[1:]])
+            timed_out = False
+            try:
+                returncode = child.wait(timeout=45)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                child.kill()
+                returncode = child.wait(timeout=10)
+            result = {{"pid": child.pid, "returncode": returncode, "timed_out": timed_out}}
+            destination = Path({str(receipts)!r}) / (str(child.pid) + ".json")
+            temporary = destination.with_suffix(".tmp")
+            temporary.write_text(json.dumps(result))
+            os.replace(temporary, destination)
+            sys.exit(1 if timed_out or returncode != 1 else 0)
+            """
+        )
+    )
+
+    cluster = Cluster()
+    task = None
+    try:
+        cluster.add_node(
+            num_cpus=0,
+            include_dashboard=False,
+            tracing_startup_hook=f"{module_name}:setup",
+            _system_config={"worker_maximum_startup_concurrency": 1},
+        )
+        # Install the hook before admitting any ordinary workers.
+        ray.init(
+            address=cluster.address,
+            runtime_env={"working_dir": str(tmp_path)},
+        )
+        worker_node = cluster.add_node(num_cpus=1, worker_path=str(launcher))
+        log_dir = Path(worker_node.get_logs_dir_path())
+
+        @ray.remote(max_retries=0)
+        def run():
+            return "unexpectedly reached task execution"
+
+        task = run.remote()
+        failure = {}
+
+        def status_retained():
+            for status_path in receipts.glob("*.json"):
+                status = json.loads(status_path.read_text())
+                pid = status["pid"]
+                native_paths = list(log_dir.glob(f"python-core-worker-*_{pid}.log"))
+                errors = "".join(
+                    path.read_text(errors="replace")
+                    for path in log_dir.glob(f"worker-*-{pid}.err")
+                )
+                if not native_paths or "ordinary-worker-tracing-startup-failure" not in errors:
+                    continue
+                failure.update(status)
+                failure["errors"] = errors
+                failure["native_logs"] = "".join(
+                    path.read_text(errors="replace") for path in native_paths
+                )
+                return True
+            return False
+
+        wait_for_condition(status_retained, timeout=75)
+        assert "RuntimeError: ordinary-worker-tracing-startup-failure" in failure["errors"]
+        assert not failure["timed_out"], failure
+        # wait(), unlike PID disappearance, rejects SIGSEGV/SIGABRT and cleanup kills.
+        assert failure["returncode"] == 1, failure
+        assert "Force exiting to avoid undefined behavior." not in failure["native_logs"]
+    finally:
+        try:
+            if task is not None:
+                ray.cancel(task)
+        finally:
+            try:
+                ray.shutdown()
+            finally:
+                cluster.shutdown()
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main(["-sv", __file__]))

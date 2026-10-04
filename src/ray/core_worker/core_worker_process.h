@@ -148,6 +148,11 @@ class CoreWorkerProcessImpl {
   /// Shutdown the driver completely at the process level.
   void ShutdownDriver();
 
+  /// Stop and join IO before native at-exit releases callback targets.
+  /// Returns false on the IO thread: the at-exit owner must then be retained
+  /// until process exit instead of destructing its currently executing frame.
+  bool StopIOThreadAtExit();
+
  private:
   /// The various options.
   const CoreWorkerOptions options_;

@@ -113,7 +113,20 @@ void CoreWorkerProcess::Shutdown() {
 
 bool CoreWorkerProcess::IsInitialized() { return core_worker_process != nullptr; }
 
-void CoreWorkerProcess::HandleAtExit() { core_worker_process.reset(); }
+void CoreWorkerProcess::HandleAtExit() {
+  if (!core_worker_process) {
+    return;
+  }
+  if (!core_worker_process->StopIOThreadAtExit()) {
+    // std::exit may run this handler on the IO thread itself. That thread cannot
+    // join its active frame, and process exit will not return to that frame.
+    // Keep its callback targets alive until the OS reclaims the process.
+    // This is only the terminal at-exit path, not ray.shutdown().
+    (void)core_worker_process.release();
+    return;
+  }
+  core_worker_process.reset();
+}
 
 CoreWorker &CoreWorkerProcess::GetCoreWorker() {
   EnsureInitialized(/*quick_exit*/ true);
@@ -862,6 +875,26 @@ CoreWorkerProcessImpl::CoreWorkerProcessImpl(const CoreWorkerOptions &options)
                        "with dashboard support: `pip install 'ray[default]'`.";
     }
   }
+}
+
+bool CoreWorkerProcessImpl::StopIOThreadAtExit() {
+  if (io_thread_.joinable() &&
+      io_thread_.get_id() == boost::this_thread::get_id()) {
+    io_service_.stop();
+    return false;
+  }
+
+  // Let an already-started graceful shutdown complete while its services and
+  // owners still exist. Do not initiate language callbacks from native atexit.
+  auto worker = TryGetCoreWorker();
+  if (worker) {
+    worker->WaitForShutdownComplete();
+  }
+  io_service_.stop();
+  if (io_thread_.joinable()) {
+    io_thread_.join();
+  }
+  return true;
 }
 
 CoreWorkerProcessImpl::~CoreWorkerProcessImpl() {
